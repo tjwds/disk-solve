@@ -2,6 +2,7 @@
 //! is gated by [`crate::safety::validate_trash_target`] and performed via the
 //! `trash` crate (recoverable macOS Trash) — never `std::fs::remove_*`.
 
+use crate::errmsg;
 use crate::safety::validate_trash_target;
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +18,10 @@ pub struct SystemTrasher;
 
 impl Trasher for SystemTrasher {
     fn trash(&self, path: &Path) -> Result<(), String> {
-        trash::delete(path).map_err(|e| e.to_string())
+        // The `trash` crate asks Finder to do the move, so a failure arrives as
+        // AppleScript's stderr inside a Debug-formatted enum. The frontend shows
+        // whatever we return verbatim, so translate it here (see [`errmsg`]).
+        trash::delete(path).map_err(|e| errmsg::trash_error(&e))
     }
 }
 

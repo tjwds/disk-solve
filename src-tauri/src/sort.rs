@@ -221,11 +221,13 @@ pub fn file_to_photos(path: &Path, home: &Path) -> Result<String, String> {
 }
 
 /// Import a single file into Apple Photos via AppleScript. The library copies the
-/// file in; the caller removes the original separately.
+/// file in; the caller removes the original separately. Photos can stall exactly
+/// like Finder does, so its stderr goes through [`crate::errmsg`] before the user
+/// ever sees it.
 fn import_to_photos(path: &Path) -> Result<(), String> {
     let posix = applescript_quote(&path.display().to_string());
     let script = format!("tell application \"Photos\" to import {{POSIX file {posix}}}");
-    run_osascript(&script).map(|_| ())
+    run_osascript(&script).map(|_| ()).map_err(|e| crate::errmsg::humanize(&e))
 }
 
 /// Show a native folder picker (`choose folder`) with the given prompt and return

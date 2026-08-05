@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import * as api from "./lib/api";
+import { errText, isMissing } from "./lib/errmsg";
 import { fmtBytes } from "./lib/format";
 import {
   defaultSettings, demoImages, leafName, moveItem,
@@ -145,7 +146,7 @@ export default function SortFlow({ home, onClose, initial = "overview", scope = 
           }
         }
       } catch (e) {
-        if (!cancelled) { setError(String(e)); setImages([]); }
+        if (!cancelled) { setError(errText(e)); setImages([]); }
       }
     })();
     return () => { cancelled = true; };
@@ -154,7 +155,7 @@ export default function SortFlow({ home, onClose, initial = "overview", scope = 
 
   const persistSettings = useCallback((next: SortSettings) => {
     setSettings(next);
-    if (tauri) api.saveSettings(next).catch((e) => setError(String(e)));
+    if (tauri) api.saveSettings(next).catch((e) => setError(errText(e)));
     else localStorage.setItem("disksolve.sortSettings", JSON.stringify(next));
   }, [tauri]);
 
@@ -550,7 +551,7 @@ function Reviewer({ queue, destinations, tauri, active, demoSeed, onComplete, on
         advance(i, next);
         return;
       }
-      onError(String(e));
+      onError(errText(e));
       return; // don't advance or record on a real failure
     }
     if (removed) onRemoveImage(f.path);
@@ -565,7 +566,7 @@ function Reviewer({ queue, destinations, tauri, active, demoSeed, onComplete, on
     if (!active || busy || history.length === 0) return;
     const entry = history[history.length - 1];
     try { await run(setBusy, entry.undo); }
-    catch (e) { onError(String(e)); return; }
+    catch (e) { onError(errText(e)); return; }
     if (entry.removed) onRestoreImage(queue[entry.index]);
     const next = statuses.slice();
     next[entry.index] = entry.prev;
@@ -672,7 +673,7 @@ function Reviewer({ queue, destinations, tauri, active, demoSeed, onComplete, on
             {cur && <span className="sf-exif">{cur.ext.toUpperCase()}</span>}
           </div>
           {tauri && cur && (
-            <button className="sf-iconbtn" title="Show in Finder" onClick={() => api.revealInFinder(cur.path).catch((e) => onError(String(e)))}>
+            <button className="sf-iconbtn" title="Show in Finder" onClick={() => api.revealInFinder(cur.path).catch((e) => onError(errText(e)))}>
               <IcReveal />
             </button>
           )}
@@ -851,11 +852,6 @@ function previewSrc(f: ImageFile, tauri: boolean): string {
 function sourcePath(f: ImageFile): string {
   // Demo paths look like /demo/Desktop/x; show a ~-style path either way.
   return f.path.replace(/^\/demo/, "~").replace(/^\/Users\/[^/]+/, "~");
-}
-/** True when an error means the file is already gone (moved/deleted elsewhere). */
-function isMissing(e: unknown): boolean {
-  const s = String(e).toLowerCase();
-  return s.includes("not found") || s.includes("does not exist") || s.includes("no such file");
 }
 function toastIcon(icon: "check" | "trash" | "skip" | "undo") {
   return icon === "check" ? <IcCheck /> : icon === "trash" ? <IcTrash /> : icon === "undo" ? <IcUndo /> : <IcSkip />;

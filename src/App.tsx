@@ -9,6 +9,7 @@ import { sortItems, resolveFilter, collectByName, withoutAggregates, parentName,
 import { removePaths } from "./lib/tree";
 import { baseName, keeperOf, pruneDupReport } from "./lib/dups";
 import { makeDemoTree, demoDuplicates } from "./lib/demo";
+import { errText, isMissing, isUnresponsive, trashFailureText } from "./lib/errmsg";
 import { notify } from "./lib/notify";
 import { demoImages, leafName } from "./lib/sort";
 import * as api from "./lib/api";
@@ -114,6 +115,10 @@ export default function App() {
   const ranOnce = useRef(false);
   const dupRunRef = useRef(0); // ignore results from a superseded duplicate scan
 
+  // Every failure lands here. It's a notice, not a mode: the scan already in
+  // memory stays on screen and stays usable, and the message can be dismissed.
+  const reportError = useCallback((e: unknown) => setError(errText(e)), []);
+
   // Collect the duplicate report once hashing (which began with the scan) drains.
   const runDups = useCallback((demoTree?: Node) => {
     const id = ++dupRunRef.current;
@@ -128,7 +133,7 @@ export default function App() {
       .catch((e) => {
         if (id !== dupRunRef.current) return;
         setDupScanning(false);
-        setError(String(e));
+        setError(errText(e));
       });
   }, []);
 
@@ -157,7 +162,9 @@ export default function App() {
         }
         runDups(); // collect the report once the streamed hashing finishes
       } catch (e) {
-        setError(String(e));
+        // The previous scan (if any) is still in state, so the view it's showing
+        // stays put; the message says why this one didn't replace it.
+        setError(errText(e));
         setDupScanning(false);
       } finally {
         setLoading(false);
@@ -187,29 +194,47 @@ export default function App() {
 
   const closeSort = useCallback(() => { setSortOpen(false); refreshLoose(); }, [refreshLoose]);
 
+  // Anything that failed without a handler — a fire-and-forget action, a stray
+  // rejection — becomes a dismissible notice instead of vanishing into the
+  // console (or, in the worst case, leaving the user staring at a stale view).
   useEffect(() => {
+    const onRejection = (e: PromiseRejectionEvent) => {
+      e.preventDefault(); // we're showing it; no need for the console's version too
+      console.error("disk-solve: unhandled rejection", e.reason);
+      reportError(e.reason);
+    };
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => window.removeEventListener("unhandledrejection", onRejection);
+  }, [reportError]);
+
+  // The backend's streamed events. Only Tauri emits them; subscribing in the
+  // browser demo just rejects (there is no IPC bridge), so don't.
+  useEffect(() => {
+    if (!api.isTauri()) return;
     let unlisten: UnlistenFn | undefined;
     listen<ScanEvent>("scan-progress", (e) => {
       const { files, bytes, total } = e.payload;
       setProgress({ files, bytes, pct: total > 0 ? Math.min(0.99, bytes / total) : 0 });
-    }).then((u) => (unlisten = u));
+    }).then((u) => (unlisten = u), reportError);
     return () => unlisten?.();
-  }, []);
+  }, [reportError]);
 
   useEffect(() => {
+    if (!api.isTauri()) return;
     let unlisten: UnlistenFn | undefined;
     listen<DupEvent>("dup-progress", (e) => {
       setDupProgress({ hashed: e.payload.hashed, total: e.payload.total });
-    }).then((u) => (unlisten = u));
+    }).then((u) => (unlisten = u), reportError);
     return () => unlisten?.();
-  }, []);
+  }, [reportError]);
 
   // Snapshots of the tree as the scan builds it, rendered behind the overlay.
   useEffect(() => {
+    if (!api.isTauri()) return;
     let unlisten: UnlistenFn | undefined;
-    listen<Node>("scan-partial", (e) => setPartial(e.payload)).then((u) => (unlisten = u));
+    listen<Node>("scan-partial", (e) => setPartial(e.payload)).then((u) => (unlisten = u), reportError);
     return () => unlisten?.();
-  }, []);
+  }, [reportError]);
 
   useEffect(() => { refreshLoose(); }, [refreshLoose]);
 
@@ -317,7 +342,7 @@ export default function App() {
         }
         if (!cancelled) setListItems(withoutAggregates(items));
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) reportError(e);
       } finally {
         if (!cancelled) setListLoading(false);
       }
@@ -325,7 +350,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [view, listSource, root?.path, tree, loadChildren]);
+  }, [view, listSource, root?.path, tree, loadChildren, reportError]);
 
   const setViewMode = useCallback((m: ViewMode) => {
     setView(m);
@@ -334,7 +359,7 @@ export default function App() {
 
   const onRecommend = useCallback((s: Suggestion) => {
     if (s.action === "openTrash") {
-      api.openTrash().catch((e) => setError(String(e)));
+      api.openTrash().catch(reportError);
       return;
     }
     if (s.action === "list") {
@@ -388,18 +413,31 @@ export default function App() {
         detail: "It goes to the macOS Trash (recoverable) — nothing is permanently deleted.",
         confirmLabel: "Move to Trash",
         onOk: async () => {
-          // Apply whatever actually reached the Trash, even on a mid-loop error.
+          // One item failing is not the batch failing: keep going, and apply
+          // whatever actually reached the Trash. The exception is macOS itself
+          // not answering — every remaining item would sit through the same
+          // timeout, so give up rather than freeze for minutes.
           const done: string[] = [];
-          try {
-            for (const p of paths) {
+          const failed: string[] = [];
+          let stopped = false;
+          for (const p of paths) {
+            try {
               await api.moveToTrash(p);
               done.push(p);
+            } catch (e) {
+              if (isMissing(e)) {
+                done.push(p); // already gone — let the row leave the view
+              } else if (isUnresponsive(e)) {
+                failed.push(errText(e));
+                stopped = true;
+                break;
+              } else {
+                failed.push(errText(e));
+              }
             }
-          } catch (e) {
-            setError(String(e));
-          } finally {
-            if (done.length) applyTrashed(done);
           }
+          if (done.length) applyTrashed(done);
+          setError(trashFailureText({ total: paths.length, done: done.length, failed, stopped }));
         },
       });
     },
@@ -409,6 +447,9 @@ export default function App() {
   const onTreemapTrash = useCallback(() => {
     if (selected?.path) trashPaths([selected.path], `${selected.name} (${fmtBytes(selected.size)})`);
   }, [selected, trashPaths]);
+
+  // The error is all there is to show: no tree in memory, and nothing on its way.
+  const scanFailed = !!error && !root && !loading;
 
   // Open the sort flow either scoped to a folder (Organize on the current folder,
   // straight into the reviewer) or unscoped (the sidebar's top-level overview).
@@ -434,14 +475,21 @@ export default function App() {
 
   return (
     <div className="app">
-      <Toolbar root={stack[0] ?? null} loading={loading} view={view} onSelectView={selectSeg} onRescan={() => stack[0] && runScan(stack[0].path)} />
+      {/* Rescan falls back to the home directory: after a scan that failed there
+          is no stack to re-run, and that's exactly when it's wanted. */}
+      <Toolbar root={stack[0] ?? null} loading={loading} view={view} onSelectView={selectSeg} onRescan={() => { const p = stack[0]?.path ?? home; if (p) runScan(p); }} />
       <div className="body">
         <Sidebar root={root} tm={tm} colorMap={colorMap} onRecommend={onRecommend} dups={dups} dupScanning={dupScanning} dupProgress={dupProgress} scanning={loading} onOpenDups={() => setView("dups")} loose={loose} onOrganize={() => openSort(null, "overview")} />
         <main className="content">
-          {error ? (
+          {/* A failed action is a notice over the view it failed in — whatever is
+              on screen stays on screen, and stays usable. The error only takes
+              the content area when there's no scan to show behind it, and then
+              it comes with a way out. */}
+          {error && !scanFailed && <ErrorBar text={error} onDismiss={() => setError(null)} />}
+          {scanFailed ? (
             <>
               <Breadcrumb stack={stack} onJump={(i) => setStack(stack.slice(0, i + 1))} />
-              <div className="state">{error}</div>
+              <ScanFailed text={error!} onRetry={home ? () => runScan(home) : undefined} />
             </>
           ) : loading || !root ? (
             <>
@@ -467,8 +515,8 @@ export default function App() {
                 onToggleCheck={toggleCheck}
                 onToggleAll={toggleAll}
                 onDrill={drill}
-                onReveal={(n) => api.revealInFinder(n.path)}
-                onTerminal={(n) => api.openTerminalHere(dirOf(n))}
+                onReveal={(n) => api.revealInFinder(n.path).catch(reportError)}
+                onTerminal={(n) => api.openTerminalHere(dirOf(n)).catch(reportError)}
                 onTrashOne={(n) => trashPaths([n.path], `${n.name} (${fmtBytes(n.size)})`)}
               />
             </>
@@ -478,7 +526,7 @@ export default function App() {
               scanning={dupScanning}
               progress={dupProgress}
               home={home}
-              onReveal={(p) => api.revealInFinder(p)}
+              onReveal={(p) => api.revealInFinder(p).catch(reportError)}
               onTrashPaths={trashPaths}
             />
           ) : (
@@ -496,13 +544,38 @@ export default function App() {
         <ListInspector
           count={checkedNodes.length}
           bytes={checkedBytes}
-          onReveal={() => checkedNodes[0] && api.revealInFinder(checkedNodes[0].path)}
+          onReveal={() => { if (checkedNodes[0]) api.revealInFinder(checkedNodes[0].path).catch(reportError); }}
           onTrash={() => trashPaths(checkedNodes.map((n) => n.path), `${checkedNodes.length} item${checkedNodes.length === 1 ? "" : "s"} (${fmtBytes(checkedBytes)})`)}
         />
       ) : (
-        <Inspector node={focus} selected={selected} onTrash={onTreemapTrash} />
+        <Inspector node={focus} selected={selected} onTrash={onTreemapTrash} onError={reportError} />
       )}
       {confirm && <ConfirmModal data={confirm} onClose={() => setConfirm(null)} />}
+    </div>
+  );
+}
+
+// A failed action, reported without taking the view away. Dismissible, because
+// the next thing the user does shouldn't have to be about the last thing that
+// went wrong.
+function ErrorBar({ text, onDismiss }: { text: string; onDismiss: () => void }) {
+  return (
+    <div className="errbar" role="alert">
+      <span className="errbar-txt">{text}</span>
+      <button className="errbar-x" title="Dismiss" onClick={onDismiss}>✕</button>
+    </div>
+  );
+}
+
+// The one case where an error does own the content area: the scan failed, so
+// there is no tree to show behind it. It always offers the way back.
+function ScanFailed({ text, onRetry }: { text: string; onRetry?: () => void }) {
+  return (
+    <div className="state">
+      <div className="state-card">
+        <div className="state-msg">{text}</div>
+        {onRetry && <button className="btn primary" onClick={onRetry}>Try again</button>}
+      </div>
     </div>
   );
 }
@@ -990,7 +1063,7 @@ function dirOf(node: Node): string {
   return parent.length > 0 ? parent : "/";
 }
 
-function Inspector({ node, selected, onTrash }: { node: Node | null; selected: Node | null; onTrash: () => void }) {
+function Inspector({ node, selected, onTrash, onError }: { node: Node | null; selected: Node | null; onTrash: () => void; onError: (e: unknown) => void }) {
   const target = selected ?? node;
   const canAct = !!target && target.path.length > 0;
   const canTrash = !!selected && selected.path.length > 0;
@@ -1001,9 +1074,9 @@ function Inspector({ node, selected, onTrash }: { node: Node | null; selected: N
         <div className="insp-sub">{node ? `${fmtBytes(node.size)} · ${node.item_count.toLocaleString()} items` : ""}</div>
       </div>
       <div className="insp-actions">
-        <button className="btn" disabled={!canAct} onClick={() => canAct && api.revealInFinder(target!.path)}>Reveal in Finder</button>
-        <button className="btn" disabled={!canAct} onClick={() => canAct && api.openTerminalHere(dirOf(target!))}>Open Terminal Here</button>
-        <button className="btn" disabled={!canAct} onClick={() => canAct && api.quickLook(target!.path)}>Quick Look</button>
+        <button className="btn" disabled={!canAct} onClick={() => canAct && api.revealInFinder(target!.path).catch(onError)}>Reveal in Finder</button>
+        <button className="btn" disabled={!canAct} onClick={() => canAct && api.openTerminalHere(dirOf(target!)).catch(onError)}>Open Terminal Here</button>
+        <button className="btn" disabled={!canAct} onClick={() => canAct && api.quickLook(target!.path).catch(onError)}>Quick Look</button>
         <button className="btn danger" disabled={!canTrash} onClick={onTrash}>Move to Trash</button>
       </div>
     </div>

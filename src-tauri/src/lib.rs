@@ -10,6 +10,7 @@ mod actions;
 mod backup;
 mod category;
 mod dups;
+mod errmsg;
 mod power;
 mod safety;
 mod scan;
@@ -258,12 +259,17 @@ fn move_to_trash(state: State<AppState>, path: String) -> Result<String, String>
         .unwrap()
         .clone()
         .ok_or("Scan a folder before trashing anything")?;
-    let result = actions::move_to_trash(&PathBuf::from(&path), &root, &actions::SystemTrasher)?;
+    let outcome = actions::move_to_trash(&PathBuf::from(&path), &root, &actions::SystemTrasher);
     // Keep the retained tree in sync so a re-fetched list reflects the removal.
-    if let Some(tree) = state.tree.lock().unwrap().as_mut() {
-        scan::remove_path(tree, &path);
+    // A failure whose target isn't on disk any more (someone else moved it) counts:
+    // the entry is stale either way, and the frontend drops those rows too.
+    let gone = outcome.is_ok() || std::fs::symlink_metadata(&path).is_err();
+    if gone {
+        if let Some(tree) = state.tree.lock().unwrap().as_mut() {
+            scan::remove_path(tree, &path);
+        }
     }
-    Ok(result)
+    outcome
 }
 
 #[tauri::command]
